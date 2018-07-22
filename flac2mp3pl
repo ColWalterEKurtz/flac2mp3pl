@@ -1,0 +1,878 @@
+#!/bin/bash
+
+# ------------------------------------------------------------------------------
+# settings                                                              settings
+# ------------------------------------------------------------------------------
+set -o errtrace  # any trap on ERR is inherited by shell functions,
+                 #   command substitutions, and commands executed in a subshell
+                 #   environment
+set -o nounset   # treat unset variables and parameters other than the special
+                 #   parameters "@" and "*" as an error when performing
+                 #   parameter expansion
+set -o pipefail  # the return value of a pipeline is the value of the last
+                 #   (rightmost) command to exit with a non-zero status, or
+                 #   zero if all commands in the pipeline exit successfully
+
+# set language
+export LANG="en_US.UTF-8"
+
+# use dot as decimal separator
+export LC_NUMERIC="en_US.UTF-8"
+
+# terminal colors
+readonly    NONE=$(tput sgr0)
+readonly     RED=$(tput setaf 1)
+readonly   GREEN=$(tput setaf 2)
+readonly  YELLOW=$(tput setaf 3)
+readonly    BLUE=$(tput setaf 4)
+readonly MAGENTA=$(tput setaf 5)
+readonly    CYAN=$(tput setaf 6)
+readonly   WHITE=$(tput setaf 7)
+
+# ------------------------------------------------------------------------------
+# functions                                                            functions
+# ------------------------------------------------------------------------------
+
+# ---------
+# show_help
+# ---------
+#
+#
+#
+function show_help()
+{
+  echo
+  echo "SYNOPSIS"
+  echo "   flac2mp3pl [options]"
+  echo
+  echo "DESCRIPTION"
+  echo "   flac2mp3pl reads NULL terminated filenames of flac files from stdin, converts"
+  echo "   them to mp3 and creates a m3u playlist of the new files in the current directory."
+  echo
+  echo "OPTIONS"
+  echo "   -h         show help and exit"
+  echo "   -v         show version and exit"
+  echo "   -p <file>  read flac filenames from m3u file"
+  echo
+  echo "EXAMPLE"
+  echo "   egrep \"\\.[Ff][Ll][Aa][Cc]\$\" playlist.m3u | tr '\\n' '\\0' | flac2mp3pl"
+  echo
+}
+
+# ------------
+# show_version
+# ------------
+#
+#
+#
+function show_version()
+{
+  echo "v2018-07-23"
+}
+
+# -------
+# failmsg
+# -------
+#
+# This function prints a red colored message via stderr.
+#
+function failmsg()
+{
+  # push to stderr
+  echo -e "${RED}[FAIL]${NONE} $1" 1>&2
+}
+
+# -------
+# warnmsg
+# -------
+#
+# This function prints a yellow colored message via stderr.
+#
+function warnmsg()
+{
+  # push to stderr
+  echo -e "${YELLOW}[WARN]${NONE} $1" 1>&2
+}
+
+# -------
+# infomsg
+# -------
+#
+# This function prints a blue colored message via stderr.
+#
+function infomsg()
+{
+  # push to stderr
+  echo -e "${BLUE}[INFO]${NONE} $1" 1>&2
+}
+
+# -------
+# donemsg
+# -------
+#
+# This function prints a green colored message via stderr.
+#
+function donemsg()
+{
+  # push to stderr
+  echo -e "${GREEN}[DONE]${NONE} $1" 1>&2
+}
+
+# --------------
+# reset_temp_dir
+# --------------
+#
+# $1  directory
+#
+function reset_temp_dir()
+{
+  # remove all files from the given directory
+  find "$1"          \
+       -maxdepth "1" \
+       -type "f"     \
+       -delete       \
+       &>"/dev/null"
+}
+
+# ----------
+# utf82ascii
+# ----------
+#
+# ... | utf82ascii | ...
+#
+function utf82ascii()
+{
+  sed --regexp-extended \
+      --expression="
+        # escape all colons
+        s/:/:c/g
+
+        # escape all native question marks (iconv may introduce much more)
+        s/\\?/:q/g
+
+        # collection of characters that aren't translated (suitable) by iconv
+        s/¦/|/g
+        s/¡/!/g
+        s/¿/:q/g
+        s/„/\"/g
+        s/«/\"/g
+        s/»/\"/g
+        s/÷/\//g
+        s/±/+-/g
+        s/¹/^1/g
+        s/²/^2/g
+        s/³/^3/g
+        s/Ä/Ae/g
+        s/ä/ae/g
+        s/Ö/Oe/g
+        s/ö/oe/g
+        s/Ü/Ue/g
+        s/ü/ue/g
+        s/Ø/Oe/g
+        s/ø/oe/g
+        s/Ð/Dh/g
+        s/ð/dh/g
+        s/Þ/Th/g
+        s/þ/th/g
+      "                                       \
+  | iconv --from-code "UTF-8"                 \
+          --to-code "ASCII//TRANSLIT//IGNORE" \
+  | sed --regexp-extended                     \
+        --expression="
+          # remove all question marks introduced by iconv
+          s/\\?//g
+
+          # restore all escaped question marks
+          s/:q/?/g
+
+          # restore all escaped colons
+          s/:c/:/g
+        "
+}
+
+# ------------
+# str2basename
+# ------------
+#
+# ... | str2basename | ...
+#
+function str2basename()
+{
+  sed --regexp-extended \
+      --expression="
+
+        # convert to lowercase
+        s/.+/\L&/
+
+        # replace all non alphanumeric characters
+        s/[^[:alnum:]]+/_/g
+
+        # trim both ends
+        s/^_+//
+        s/_+$//
+
+        # limit filename to the first 200 characters
+        s/^(.{200}).*/\1/
+
+        # trim end
+        s/_+$//
+      "
+}
+
+# ---------
+# get_genre
+# ---------
+#
+# $1  flac file
+#
+function get_genre()
+{
+  metaflac --export-tags-to=- "$1" 2>"/dev/null" \
+  | sed --quiet                                  \
+        --regexp-extended                        \
+        --expression="
+
+          s/^GENRE=(.+)/\1/p
+
+        "
+}
+
+# ----------
+# get_artist
+# ----------
+#
+# $1  flac file
+#
+function get_artist()
+{
+  metaflac --export-tags-to=- "$1" 2>"/dev/null" \
+  | sed --quiet                                  \
+        --regexp-extended                        \
+        --expression="
+
+          s/^ARTIST=(.+)/\1/p
+
+        "
+}
+
+# ---------
+# get_album
+# ---------
+#
+# $1  flac file
+#
+function get_album()
+{
+  metaflac --export-tags-to=- "$1" 2>"/dev/null" \
+  | sed --quiet                                  \
+        --regexp-extended                        \
+        --expression="
+
+          s/^ALBUM=(.+)/\1/p
+
+        "
+}
+
+# --------
+# get_year
+# --------
+#
+# $1  flac file
+#
+function get_year()
+{
+  metaflac --export-tags-to=- "$1" 2>"/dev/null" \
+  | sed --quiet                                  \
+        --regexp-extended                        \
+        --expression="
+
+          s/^DATE=(.+)/\1/p
+
+        "
+}
+
+# ---------------
+# get_tracknumber
+# ---------------
+#
+# $1  flac file
+#
+function get_tracknumber()
+{
+  metaflac --export-tags-to=- "$1" 2>"/dev/null" \
+  | sed --quiet                                  \
+        --regexp-extended                        \
+        --expression="
+
+          # remove leading zeros
+          s/^TRACKNUMBER=0*([[:digit:]]+)/\1/p
+
+        "
+}
+
+# ---------
+# get_title
+# ---------
+#
+# $1  flac file
+#
+function get_title()
+{
+  metaflac --export-tags-to=- "$1" 2>"/dev/null" \
+  | sed --quiet                                  \
+        --regexp-extended                        \
+        --expression="
+
+          s/^TITLE=(.+)/\1/p
+
+        "
+}
+
+# ------------------
+# list_picture_specs
+# ------------------
+#
+# $1  flac file
+#
+# stdout: BLOCK_NUMBER;PICTURE_TYPE;EXTENSION
+#
+function list_picture_specs()
+{
+  # get number of each picture block
+  metaflac --list                 \
+           --block-type="PICTURE" \
+           "$1"                   \
+  | sed --quiet                   \
+        --regexp-extended         \
+        --expression="
+
+          # set line to operate
+          /^METADATA block #[[:digit:]]+/ {
+
+            # crop block number
+            s/^METADATA[[:space:]]+block[[:space:]]+#([[:digit:]]+)$/\1/
+
+            # copy block number to hold space
+            h
+
+            # start searching for picture type here
+            :pictype
+
+            # invalid beginning of wanted line
+            /^  type:/! { n; b pictype }
+
+            # invalid end of wanted line
+            /.+\(PICTURE\)$/ { n; b pictype }
+
+            # crop name of picture type
+            s/^[^\(]+\((.+)\)$/\1/
+
+            # simplify type name
+            s/[^[:alnum:]]+/_/g; s/^_//; s/_$//
+
+            # convert to upper case
+            s/.+/\U&/
+
+            # append picture type to hold space
+            H
+
+            # start searching for mime type here
+            :mimetype
+
+            # invalid beginning of wanted line
+            /^  MIME type:/! { n; b mimetype }
+
+            # crop mime type
+            s/^[[:space:]]+MIME[[:space:]]+type:[[:space:]]+(.+)$/\1/
+
+            # get extension from mime type and convert it to lowercase
+            s|.+/([^/]+)$|\L\1|
+
+            # simplify jpeg extension
+            s/jpeg/jpg/
+
+            # append extension to hold space
+            H
+
+            # copy hold space to pattern space
+            g
+
+            # replace all NL characters with semicolons
+            s/\x0A/;/g
+
+            # print non-empty lines
+            /^.+$/{ p }
+          }
+        "
+}
+
+# -------------------------
+# extract_embedded_pictures
+# -------------------------
+#
+# $1  source flac file
+# $2  target directory (trailing slash expected)
+#
+function extract_embedded_pictures()
+{
+  # extract embedded pictures
+  list_picture_specs "$1" | while read SPEC
+  do
+
+    # get particular information from SPEC string
+    local BLOCK=$(sed -re 's/^([^;]+);([^;]+);([^;]+)$/\1/' <<< "$SPEC")
+    local PTYPE=$(sed -re 's/^([^;]+);([^;]+);([^;]+)$/\2/' <<< "$SPEC")
+    local EXTSN=$(sed -re 's/^([^;]+);([^;]+);([^;]+)$/\3/' <<< "$SPEC")
+
+    # extract only jpg and png pictures
+    if [ "$EXTSN" != "jpg" ] && [ "$EXTSN" != "png" ] ; then
+
+      # notify user
+      warnmsg "unexpected picture format: \"$EXTSN\""
+
+      # next picture
+      continue
+
+    fi
+
+    # set filename
+    local FILENAME="$2$PTYPE.$EXTSN"
+
+    # export picture
+    metaflac --block-number="$BLOCK" --export-picture-to="$FILENAME" "$1"
+
+  done
+}
+
+# ---------------
+# get_mp3_picture
+# ---------------
+#
+# $1  picture directory (trailing slash expected)
+#
+function get_mp3_picture()
+{
+  # check extracted pictures in this order
+  for PTYPE in "COVER_FRONT"                        \
+               "OTHER"                              \
+               "ILLUSTRATION"                       \
+               "COVER_BACK"                         \
+               "LEAD_ARTIST_LEAD_PERFORMER_SOLOIST" \
+               "ARTIST_PERFORMER"                   \
+               "CONDUCTOR"                          \
+               "BAND_ORCHESTRA"                     \
+               "COMPOSER"                           \
+               "LYRICIST_TEXT_WRITER"               \
+               "LEAFLET_PAGE"                       \
+               "MEDIA_E_G_LABEL_SIDE_OF_CD"         \
+               "RECORDING_LOCATION"                 \
+               "DURING_RECORDING"                   \
+               "DURING_PERFORMANCE"                 \
+               "MOVIE_VIDEO_SCREEN_CAPTURE"         \
+               "BAND_ARTIST_LOGOTYPE"               \
+               "PUBLISHER_STUDIO_LOGOTYPE"
+  do
+
+    # check for these files
+    local FILENAME1="$1$PTYPE.png"
+    local FILENAME2="$1$PTYPE.jpg"
+
+    # use png files first
+    if [ -s "$FILENAME1" ] ; then
+
+      # push filename to stdout
+      echo "$FILENAME1"
+
+      # exit function
+      return 0
+
+    fi
+
+    # use jpg files second
+    if [ -s "$FILENAME2" ] ; then
+
+      # push filename to stdout
+      echo "$FILENAME2"
+
+      # exit function
+      return 0
+
+    fi
+
+  done
+
+  # no picture found
+  return 1
+}
+
+# -----------------
+# get_target_subdir
+# -----------------
+#
+# $1  genre
+# $2  artist
+# $3  album
+# $4  date
+# $5  tracknumber
+# $6  title
+#
+function get_target_subdir()
+{
+  # use scheme: ARTIST/ALBUM/
+  local DIR1=$(str2basename <<< "$2")
+  local DIR2=$(str2basename <<< "$3")
+
+  # check names
+  [ -z "$DIR1" ] && return 1
+  [ -z "$DIR2" ] && return 1
+
+  # push name to stdout
+  echo "$DIR1/$DIR2/"
+
+  # signalize success
+  return 0
+}
+
+# -------------------
+# get_target_basename
+# -------------------
+#
+# $1  genre
+# $2  artist
+# $3  album
+# $4  date
+# $5  tracknumber
+# $6  title
+#
+function get_target_basename()
+{
+  # use scheme: TRACKNUMBER_TITLE.mp3
+  local PART1=$(printf "%03d" "$5")
+  local PART2=$(str2basename <<< "$6")
+
+  # check parts
+  [ -z "$PART1" ] && return 1
+  [ -z "$PART2" ] && return 1
+
+  # push name to stdout
+  echo "${PART1}_${PART2}.mp3"
+
+  # signalize success
+  return 0
+}
+
+# ---------------
+# create_wav_file
+# ---------------
+#
+# $1  source file
+# $2  target wav file
+#
+function create_wav_file()
+{
+  sox -V0                         \
+      --guard                     \
+      "$1"                        \
+      --type     "raw"            \
+      --channels "2"              \
+      --rate     "44100"          \
+      --bits     "24"             \
+      --encoding "signed-integer" \
+      --endian   "little"         \
+      "$2"
+}
+
+# ---------------
+# create_mp3_file
+# ---------------
+#
+# $1  source file
+# $2  mp3 file
+# $3  genre
+# $4  artist
+# $5  album
+# $6  date
+# $7  tracknumber
+# $8  title
+# $9  picture
+#
+function create_mp3_file()
+{
+  # add only given tags
+  local -a ID3V2TAGS
+
+  # start tag options
+  ID3V2TAGS=( "--id3v2-only" )
+
+  # add GENRE tag
+  if [ -n "$3" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--tg" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$3" )
+
+  fi
+
+  # add ARTIST tag
+  if [ -n "$4" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--ta" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$4" )
+
+  fi
+
+  # add ALBUM tag
+  if [ -n "$5" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--tl" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$5" )
+
+  fi
+
+  # add YEAR tag
+  if [ -n "$6" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--ty" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$6" )
+
+  fi
+
+  # add TRACKNUMBER tag
+  if [ -n "$7" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--tn" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$7" )
+
+  fi
+
+  # add TITLE tag
+  if [ -n "$8" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--tt" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$8" )
+
+  fi
+
+  # add picture
+  if [ -n "$9" ] ; then
+
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "--ti" )
+    ID3V2TAGS=( "${ID3V2TAGS[@]}" "$9" )
+
+  fi
+
+  # create mp3 file
+  lame --brief                \
+       --strictly-enforce-ISO \
+       --noreplaygain         \
+       -p                     \
+       -r                     \
+       -s "44.1"              \
+       --bitwidth "24"        \
+       --signed               \
+       --little-endian        \
+       --vbr-new              \
+       -V "0"                 \
+       -b "160"               \
+       -B "320"               \
+       -F                     \
+       "${ID3V2TAGS[@]}"      \
+       "$1"                   \
+       "$2"
+}
+
+# ------------------------------------------------------------------------------
+# options                                                                options
+# ------------------------------------------------------------------------------
+
+# set default values
+OPMODE="DEFAULT"
+INPUTLIST=""
+
+# set options to accept
+readonly KNOWN_OPTIONS=":hvp:"
+
+# check passed options
+while getopts "$KNOWN_OPTIONS" OPTION "$@"
+do
+
+  case "$OPTION" in
+
+    # show help
+    "h") OPMODE="SHOW_HELP"
+         ;;
+
+    # show version
+    "v") OPMODE="SHOW_VERSION"
+         ;;
+
+    # read playlist
+    "p") OPMODE="READ_PLAYLIST"
+         INPUTLIST="$OPTARG"
+         ;;
+
+
+    "?") failmsg "unknown option: -$OPTARG"
+         exit 1
+         ;;
+
+    ":") failmsg "missing argument: -$OPTARG <argument>"
+         exit 1
+         ;;
+
+  esac
+
+done
+
+# get number of positional parameters
+PPNUM=$(( $# - OPTIND + 1 ))
+
+# check number of positional parameters
+if (( PPNUM > 0 )) ; then
+
+  # notify user
+  failmsg "no positional parameters allowed"
+
+  # signalize trouble
+  exit 1
+
+fi
+
+# drop all parsed options
+shift $(( OPTIND - 1 ))
+
+# ------------------------------------------------------------------------------
+# commands                                                              commands
+# ------------------------------------------------------------------------------
+
+# show help
+if [ "$OPMODE" == "SHOW_HELP" ] ; then
+
+  show_help
+
+  # stop here
+  exit 0
+
+fi
+
+# show version
+if [ "$OPMODE" == "SHOW_VERSION" ] ; then
+
+  show_version
+
+  # stop here
+  exit 0
+
+fi
+
+# read media files from playlist
+if [ "$OPMODE" == "READ_PLAYLIST" ] ; then
+
+  # pipe all flac files to new instance
+  egrep "\.[Ff][Ll][Aa][Cc]$" "$INPUTLIST" \
+  | sed -re "s|^file:///|/|"               \
+  | tr '\n' '\0'                           \
+  | "$0"
+
+  # stop here
+  exit $?
+
+fi
+
+# create temporary directory (assert trailing slash)
+readonly TEMPDIR="$(mktemp --directory --suffix=".flac2mp3pl")/"
+
+# clean up on exit
+trap 'rm -rf "$TEMPDIR"' EXIT
+
+# the playlist file to create
+readonly PFILE="playlist.m3u"
+
+# set temporary filename
+readonly WFILE="${TEMPDIR}temp.wav"
+
+# read NULL terminated filenames from stdin
+while read -d $'\0' FILENAME
+do
+
+  # check path
+  if [ ! -f "$FILENAME" ] ; then
+
+    # notify user
+    warnmsg "unable to locate file: \"$FILENAME\""
+
+    # next file
+    continue
+
+  fi
+
+  # show progress
+  infomsg "$FILENAME"
+
+  # remove all old files
+  reset_temp_dir "$TEMPDIR"
+
+  # get simplified versions of these tags
+   GENRE=$(get_genre       "$FILENAME" | utf82ascii)
+  ARTIST=$(get_artist      "$FILENAME" | utf82ascii)
+   ALBUM=$(get_album       "$FILENAME" | utf82ascii)
+    YEAR=$(get_year        "$FILENAME" | utf82ascii)
+   TRKNO=$(get_tracknumber "$FILENAME" | utf82ascii)
+   TITLE=$(get_title       "$FILENAME" | utf82ascii)
+
+  # check some extracted tags
+  [ -z "$GENRE"  ] && GENRE="no genre"
+  [ -z "$ARTIST" ] && ARTIST="no artist"
+  [ -z "$ALBUM"  ] && ALBUM="no album"
+  [ -z "$TRKNO"  ] && TRKNO="0"
+  [ -z "$TITLE"  ] && TITLE="no title"
+
+  # extract all pictures from the current flac file
+  extract_embedded_pictures "$FILENAME" "$TEMPDIR"
+
+  # get one picture to encode in the mp3 file
+  MP3PICTURE=$(get_mp3_picture "$TEMPDIR")
+
+  # get name of the target directory
+  SUBDIR=$(get_target_subdir "$GENRE"  \
+                             "$ARTIST" \
+                             "$ALBUM"  \
+                             "$YEAR"   \
+                             "$TRKNO"  \
+                             "$TITLE"  )
+
+  # create target directory
+  mkdir -p "$SUBDIR"
+
+  # get name of the target file
+  OBASE=$(get_target_basename "$GENRE"  \
+                              "$ARTIST" \
+                              "$ALBUM"  \
+                              "$YEAR"   \
+                              "$TRKNO"  \
+                              "$TITLE"  )
+
+  # set output filename
+  OFILE="${SUBDIR}${OBASE}"
+
+  # convert media file to wave
+  create_wav_file "$FILENAME" "$WFILE"
+
+  # convert wave file to mp3
+  create_mp3_file "$WFILE"  \
+                  "$OFILE"  \
+                  "$GENRE"  \
+                  "$ARTIST" \
+                  "$ALBUM"  \
+                  "$YEAR"   \
+                  "$TRKNO"  \
+                  "$TITLE"  \
+                  "$MP3PICTURE"
+
+  # update playlist
+  echo "$OFILE" >> "$PFILE"
+
+done
+
+# signalize success
+exit 0
+
